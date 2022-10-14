@@ -48,6 +48,8 @@
 (require 'cl-lib)
 (require 'rx)
 (require 'subr-x)
+(require 'simple-httpd)
+(require 'aio)
 
 ;; Customization
 ;;; Code:
@@ -286,6 +288,11 @@ entries."
   :group 'org-gcal
   :type 'string)
 
+(defcustom org-gcal-redirect-uri "http://localhost:8080/org-gcal"
+  "Variable to define redirect url for retrieving auth token."
+  :group 'org-gcal
+  :type 'string)
+
 (defvar org-gcal--sync-lock nil
   "Set if a sync function is running.")
 
@@ -299,7 +306,7 @@ See: https://developers.google.com/calendar/v3/reference/events/insert."
   :group 'org-gcal
   :type 'string)
 
-(defconst org-gcal-auth-url "https://accounts.google.com/o/oauth2/auth"
+(defconst org-gcal-auth-url "https://accounts.google.com/o/oauth2/v2/auth"
   "Google OAuth2 server URL.")
 
 (defconst org-gcal-token-url "https://www.googleapis.com/oauth2/v3/token"
@@ -1401,48 +1408,82 @@ delete calendar info from events on calendars you no longer have access to."
     (browse-url gcal-auth-url)
     (read-string prompt)))
 
+;; http server
+(defun start-redirect-server ()
+  (message "starting local redirect server for retrieving authorization code")
+  (setq httpd-root "www/"
+        httpd-port "8080")
+  (httpd-start))
+
+(defun stop-redirect-server ()
+  (message "Stopping the redirect server...")
+  (httpd-stop)
+  (when-let ((httpd-buffer (get-buffer "*httpd*")))
+    (message "Also killing the httpd buffer...")
+    (kill-buffer "*httpd*")))
+
+(defun org-gcal-request-authorization-p ()
+  ""
+  (start-redirect-server)
+  (let ((promise (aio-promise)))
+    (prog1 promise
+      (defservlet* org-gcal text/html (code)
+        (when code
+          (insert "<p> Connected. Return to emacs</p> <script type='text/javascript'>setTimeout(function() {close()}, 1500);</script>")
+          (stop-redirect-server)
+          (aio-resolve promise
+                       (lambda () code))))
+      (browse-url (concat org-gcal-auth-url
+                          "?client_id=" (url-hexify-string org-gcal-client-id)                          
+                          "&response_type=code"
+                          "&access_type=offline"
+                          "&prompt=consent"
+                          "&redirect_uri=" (url-hexify-string org-gcal-redirect-uri)
+                          "&scope=" (url-hexify-string org-gcal-resource-url))))))
+  
 (defun org-gcal-request-token ()
   "Refresh OAuth access at TOKEN-URL.
 
   Returns a ‘deferred’ object that can be used to wait for completion."
   (interactive)
-  (deferred:$
-    (request-deferred
-     org-gcal-token-url
-     :type "POST"
-     :data `(("client_id" . ,org-gcal-client-id)
-             ("client_secret" . ,org-gcal-client-secret)
-             ("code" . ,(org-gcal-request-authorization))
-             ("redirect_uri" .  "urn:ietf:wg:oauth:2.0:oob")
-             ("grant_type" . "authorization_code"))
-     :parser 'org-gcal--json-read)
-    (deferred:nextc it
-      (lambda (response)
-        (let
-            ((data (request-response-data response))
-             (status-code (request-response-status-code response))
-             (error-thrown (request-response-error-thrown response)))
-          (cond
-           ;; If there is no network connectivity, the response will not
-           ;; include a status code.
-           ((eq status-code nil)
-            (org-gcal--notify
-             "Got Error"
-             "Could not contact remote service. Please check your network connectivity.")
-            (error "Network connectivity issue %s: %s" status-code error-thrown))
-           ;; Generic error-handler meant to provide useful information about
-           ;; failure cases not otherwise explicitly specified.
-           ((not (eq error-thrown nil))
-            (org-gcal--notify
-             (concat "Status code: " (number-to-string status-code))
-             (pp-to-string error-thrown))
-            (error "Got error %S: %S" status-code error-thrown))
-           ;; Fetch was successful.
-           (t
-            (when data
-              (setq org-gcal-token-plist data)
-              (org-gcal--save-sexp data org-gcal-token-file))
-            (deferred:succeed nil))))))))
+  (let ((auth-code (aio-wait-for (org-gcal-request-authorization-p))))        
+    (deferred:$
+      (request-deferred
+       org-gcal-token-url
+       :type "POST"
+       :data `(("client_id" . ,org-gcal-client-id)
+               ("client_secret" . ,org-gcal-client-secret)
+               ("code" . ,auth-code)
+               ("redirect_uri" .  ,org-gcal-redirect-uri)
+               ("grant_type" . "authorization_code"))
+       :parser 'org-gcal--json-read)
+      (deferred:nextc it
+        (lambda (response)
+          (let
+              ((data (request-response-data response))
+               (status-code (request-response-status-code response))
+               (error-thrown (request-response-error-thrown response)))
+            (cond
+             ;; If there is no network connectivity, the response will not
+             ;; include a status code.
+             ((eq status-code nil)
+              (org-gcal--notify
+               "Got Error"
+               "Could not contact remote service. Please check your network connectivity.")
+              (error "Network connectivity issue %s: %s" status-code error-thrown))
+             ;; Generic error-handler meant to provide useful information about
+             ;; failure cases not otherwise explicitly specified.
+             ((not (eq error-thrown nil))
+              (org-gcal--notify
+               (concat "Status code: " (number-to-string status-code))
+               (pp-to-string error-thrown))
+              (error "Got error %S: %S" status-code error-thrown))
+             ;; Fetch was successful.
+             (t
+              (when data
+                (setq org-gcal-token-plist data)
+                (org-gcal--save-sexp data org-gcal-token-file))
+              (deferred:succeed nil)))))))))
 
 (defun org-gcal--refresh-token ()
   "Refresh OAuth access and return the new access token as a deferred object."
@@ -1491,7 +1532,7 @@ delete calendar info from events on calendars you no longer have access to."
         ; Check if headline is managed by `org-gcal', and hasn't been archived
         ; yet. Only in that case, potentially archive.
         (when (and (assoc "ORG-GCAL-MANAGED" properties)
-                     (not (assoc "ARCHIVE_TIME" properties)))
+                   (not (assoc "ARCHIVE_TIME" properties)))
 
           ; Go to beginning of line to parse the headline
           (beginning-of-line)
