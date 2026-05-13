@@ -13,21 +13,21 @@ jobs:
 
     steps:
     - name: Checkout org-gcal repo
-      uses: actions/checkout@v2
+      uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2
 
     - name: Install Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@e9aba2c848f5ebd159c070c61ea2c4e2b122355e # v2
       with:
         python-version: '3.6'
         architecture: 'x64'
 
     - name: Install Emacs
-      uses: purcell/setup-emacs@master
+      uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5 # master
       with:
         version: ${{matrix.emacs_version}}
 
     - name: Install Cask
-      uses: conao3/setup-cask@master
+      uses: conao3/setup-cask@3f143bc90edc2b8eb2ebde69bd59eeea4967975e # master
       with:
         version: 'snapshot'
 
@@ -42,7 +42,7 @@ jobs:
 
     - name: SSH into container on failure
       if: ${{ failure() }}
-      uses: lhotari/action-upterm@v1
+      uses: lhotari/action-upterm@b0357f23233f5ea6d58947c0c402e0631bab7334 # v1
       with:
         ## limits ssh access and adds the ssh public key for the user which triggered the workflow
         limit-access-to-actor: true
